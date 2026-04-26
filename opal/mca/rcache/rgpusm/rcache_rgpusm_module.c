@@ -103,9 +103,16 @@ static int mca_rcache_rgpusm_open_mem_handle(void *base, size_t size, mca_rcache
     int result;
     mca_opal_gpu_reg_t *gpu_newreg = (mca_opal_gpu_reg_t *) newreg;
 
+    fprintf(stderr, "[DEBUG] open_mem_handle: About to call open_ipc_handle for base=%p, size=%zu\n", base, size);
+    fflush(stderr);
+    
     // Note: It is expected that the ipc_handle object was created previously in the smcuda component
     result = opal_accelerator.open_ipc_handle(MCA_ACCELERATOR_NO_DEVICE_ID, &gpu_newreg->data.ipcHandle,
                                               (void**)&newreg->alloc_base);
+    
+    fprintf(stderr, "[DEBUG] open_mem_handle: open_ipc_handle returned result=%d, alloc_base=%p\n", 
+            result, (void*)newreg->alloc_base);
+    fflush(stderr);
     if (OPAL_ERR_WOULD_BLOCK == result) {
         // ERROR_ALREADY_MAPPED
         opal_output_verbose(10, mca_rcache_rgpusm_component.output,

@@ -17,6 +17,22 @@
 #include "opal/util/output.h"
 #include "ompi/info/info_memkind.h"
 #include <string.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <sys/prctl.h>
+
+/* VMM IPC descriptor structure for file descriptor-based IPC */
+#if HIP_VERSION >= 50300000
+#define OPAL_ROCM_VMM_SUPPORT 1
+struct vmm_ipc_descriptor {
+    int32_t fd;            /* File descriptor (shareable) - must be int32_t not uint64_t! */
+    uint32_t pid;          /* Sender's process ID */
+    void *base_addr;       /* Base address in sender's VA space */
+    size_t alloc_size;     /* Total allocation size */
+    size_t offset;         /* Offset from base to actual pointer */
+    uint32_t is_vmm;       /* 1 for VMM, 0 for traditional */
+};
+#endif
 
 /* Accelerator API's */
 static int mca_accelerator_rocm_check_addr(const void *addr, int *dev_id, uint64_t *flags);
@@ -124,6 +140,25 @@ opal_accelerator_base_module_t opal_accelerator_rocm_module =
     .get_memkind = mca_accelerator_rocm_get_memkind
 };
 
+#if OPAL_ROCM_VMM_SUPPORT
+/*
+ * Check if a pointer is a VMM (Virtual Memory Management) allocation.
+ * VMM allocations are context-free and require special IPC handling.
+ * 
+ * IMPORTANT: VMM allocations must be created with requestedHandleTypes set to
+ * hipMemHandleTypePosixFileDescriptor for IPC to work.
+ */
+static int mca_accelerator_rocm_vmm_enabled = 1; /* Global flag to enable/disable VMM - DISABLED due to hipMemRetainAllocationHandle crash on non-VMM */
+static int mca_accelerator_rocm_vmm_prctl_set = 0; /* Track if prctl was called */
+
+static int mca_accelerator_rocm_check_vmm(hipDeviceptr_t dbuf, hipMemoryType *mem_type,
+                                          int *dev_id)
+{
+    /* Do NOT call this from check_addr() - it's called too frequently and may crash.
+     * Only use VMM detection in get_ipc_handle() where we actually need it. */
+    return 0;
+}
+#endif
 
 static int mca_accelerator_rocm_check_addr (const void *addr, int *dev_id, uint64_t *flags)
 {
@@ -138,21 +173,42 @@ static int mca_accelerator_rocm_check_addr (const void *addr, int *dev_id, uint6
     }
 
     *flags = 0;
+    fprintf(stderr, "[DEBUG] check_addr: Checking addr=%p\n", addr);
+    fflush(stderr);
+    
     err = hipPointerGetAttributes(&srcAttr, addr);
+    
+    fprintf(stderr, "[DEBUG] check_addr: hipPointerGetAttributes returned err=%d\n", err);
+    fflush(stderr);
     if (hipSuccess == err) {
 #if HIP_VERSION >= 50731921
-        if (hipMemoryTypeDevice == srcAttr.type) {
+        hipMemoryType mem_type = srcAttr.type;
 #else
-        if (hipMemoryTypeDevice == srcAttr.memoryType) {
+        hipMemoryType mem_type = srcAttr.memoryType;
 #endif
+
+#if OPAL_ROCM_VMM_SUPPORT
+        /* Check for VMM allocation */
+        int is_vmm = 0;
+        int vmm_dev_id = MCA_ACCELERATOR_NO_DEVICE_ID;
+        hipMemoryType vmm_mem_type = 0;
+        
+        is_vmm = mca_accelerator_rocm_check_vmm((hipDeviceptr_t)addr,
+                                                &vmm_mem_type, &vmm_dev_id);
+        
+        if (is_vmm && (vmm_mem_type == hipMemoryTypeDevice)) {
+            /* VMM device memory */
+            *dev_id = vmm_dev_id;
+            opal_accelerator_rocm_lazy_init();
+            return 1;
+        }
+#endif
+
+        if (hipMemoryTypeDevice == mem_type) {
             opal_accelerator_rocm_lazy_init();
             *dev_id = srcAttr.device;
             ret = 1;
-#if HIP_VERSION >= 50731921
-        } else if (hipMemoryTypeUnified == srcAttr.type) {
-#else
-        } else if (hipMemoryTypeUnified == srcAttr.memoryType) {
-#endif
+        } else if (hipMemoryTypeUnified == mem_type) {
             *flags |= MCA_ACCELERATOR_FLAGS_UNIFIED_MEMORY;
             opal_accelerator_rocm_lazy_init();
             *dev_id = srcAttr.device;
@@ -351,7 +407,7 @@ static int mca_accelerator_rocm_memcpy(int dest_dev_id, int src_dev_id, void *de
                                        opal_accelerator_transfer_type_t type)
 {
     hipError_t err;
-
+printf("mca_accelerator_rocm_memcpy -----------------  11\n");
     if (NULL == src || NULL == dest || size < 0) {
         return OPAL_ERR_BAD_PARAM;
     }
@@ -365,11 +421,13 @@ static int mca_accelerator_rocm_memcpy(int dest_dev_id, int src_dev_id, void *de
         memcpy(dest, src, size);
         return OPAL_SUCCESS;
     }
+printf("mca_accelerator_rocm_memcpy -----------------  22\n");    
 
     if (type == MCA_ACCELERATOR_TRANSFER_HTOD && size <= opal_accelerator_rocm_memcpyH2D_limit) {
         memcpy(dest, src, size);
         return OPAL_SUCCESS;
     }
+printf("mca_accelerator_rocm_memcpy -----------------  33\n");    
 
     if (opal_accelerator_rocm_memcpy_async) {
         err = hipMemcpyAsync(dest, src, size, hipMemcpyDefault,
@@ -379,7 +437,7 @@ static int mca_accelerator_rocm_memcpy(int dest_dev_id, int src_dev_id, void *de
                                 "error starting async copy\n");
             return OPAL_ERROR;
         }
-
+printf("mca_accelerator_rocm_memcpy -----------------  44\n");
         err = hipStreamSynchronize(*opal_accelerator_rocm_MemcpyStream);
         if (hipSuccess != err ) {
             opal_output_verbose(10, opal_accelerator_base_framework.framework_output,
@@ -393,6 +451,7 @@ static int mca_accelerator_rocm_memcpy(int dest_dev_id, int src_dev_id, void *de
                                 "error during synchronous copy\n");
             return OPAL_ERROR;
         }
+        printf("mca_accelerator_rocm_memcpy -----------------  55\n");
         err = hipStreamSynchronize(0);
         if (hipSuccess != err ) {
             opal_output_verbose(10, opal_accelerator_base_framework.framework_output,
@@ -572,8 +631,26 @@ static bool mca_accelerator_rocm_is_ipc_enabled(void)
 static void mca_accelerator_rocm_ipc_handle_destruct(opal_accelerator_rocm_ipc_handle_t *handle)
 {
     if (NULL != handle && NULL != handle->base.dev_ptr) {
+#if OPAL_ROCM_VMM_SUPPORT
+        /* Check if this was a VMM allocation */
+        struct vmm_ipc_descriptor vmm_desc;
+        memcpy(&vmm_desc, handle->base.handle, sizeof(vmm_desc));
+
+        if (vmm_desc.is_vmm == 1) {
+            /* VMM cleanup */
+            void *base_addr = (char*)handle->base.dev_ptr - vmm_desc.offset;
+
+            hipMemUnmap(base_addr, vmm_desc.alloc_size);
+            hipMemAddressFree(base_addr, vmm_desc.alloc_size);
+            /* Note: imported_handle cleanup happens automatically */
+
+            handle->base.dev_ptr = NULL;
+            return;
+        }
+#endif
+        /* Traditional IPC cleanup */
         hipIpcCloseMemHandle((hipDeviceptr_t) handle->base.dev_ptr);
-	handle->base.dev_ptr = NULL;
+        handle->base.dev_ptr = NULL;
     }
 }
 
@@ -586,19 +663,136 @@ OBJ_CLASS_INSTANCE(
 static int mca_accelerator_rocm_get_ipc_handle(int dev_id, void *dev_ptr,
                                                opal_accelerator_ipc_handle_t *handle)
 {
+    hipError_t err;
+    opal_accelerator_rocm_ipc_handle_t *rocm_handle;
+
     if (NULL == dev_ptr || NULL == handle) {
         return OPAL_ERR_BAD_PARAM;
     }
 
-    hipIpcMemHandle_t rocm_ipc_handle;
-    opal_accelerator_rocm_ipc_handle_t *rocm_handle = (opal_accelerator_rocm_ipc_handle_t *) handle;
+// Check if pointer supports legacy IPC
+int is_legacy_ipc = 0;
+err = hipPointerGetAttribute(&is_legacy_ipc,
+                              HIP_POINTER_ATTRIBUTE_IS_LEGACY_HIP_IPC_CAPABLE,
+                              (hipDeviceptr_t)dev_ptr);
 
+if (err == hipSuccess && is_legacy_ipc) {
+    // Use traditional IPC path
+    fprintf(stderr, "[DEBUG] Pointer supports legacy IPC\n");
+} else {
+    // May need VMM IPC path
+    fprintf(stderr, "[DEBUG] Pointer does NOT support legacy IPC\n");
+}
+
+
+    rocm_handle = (opal_accelerator_rocm_ipc_handle_t *) handle;
     OBJ_CONSTRUCT(rocm_handle, opal_accelerator_rocm_ipc_handle_t);
     rocm_handle->base.dev_ptr = NULL;
 
+#if OPAL_ROCM_VMM_SUPPORT
+    /* Try to get allocation handle - only works for VMM allocations */
+    /* Only attempt VMM detection if explicitly enabled */
+    if (mca_accelerator_rocm_vmm_enabled && !is_legacy_ipc) {
+        fprintf(stderr, "[DEBUG] get_ipc_handle: VMM enabled, dev_ptr=%p\n", dev_ptr);
+        
+        /* Set prctl permission for FD exchange (only once) */
+        if (!mca_accelerator_rocm_vmm_prctl_set) {
+            fprintf(stderr, "[DEBUG] get_ipc_handle: Setting prctl\n");
+            prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+            mca_accelerator_rocm_vmm_prctl_set = 1;
+        }
+
+        /* Try VMM detection - hipMemRetainAllocationHandle succeeds only for VMM
+         * For non-VMM pointers, this will return an error (not crash in newer HIP versions)
+         * and we fall back to traditional IPC */
+        fprintf(stderr, "[DEBUG] get_ipc_handle: About to call hipMemRetainAllocationHandle on %p\n", dev_ptr);
+        fflush(stderr);
+        
+        hipMemGenericAllocationHandle_t alloc_handle;
+        err = hipMemRetainAllocationHandle(&alloc_handle, dev_ptr);
+        
+        fprintf(stderr, "[DEBUG] get_ipc_handle: hipMemRetainAllocationHandle returned err=%d (%s)\n", 
+                err, hipGetErrorString(err));
+        fflush(stderr);
+
+        /* Only proceed with VMM IPC if we successfully got the handle */
+        if (hipSuccess == err) {
+            fprintf(stderr, "[DEBUG] get_ipc_handle: VMM detected! handle=%p\n", (void*)alloc_handle);
+        /* This is a VMM allocation - use FD-based IPC */
+        struct vmm_ipc_descriptor vmm_desc;
+        void *base_addr;
+        size_t alloc_size;
+        int fd;
+
+        /* Get base address and size */
+        err = hipMemGetAddressRange(&base_addr, &alloc_size, (hipDeviceptr_t)dev_ptr);
+        if (hipSuccess != err) {
+            hipMemRelease(alloc_handle);
+            OBJ_DESTRUCT(rocm_handle);
+            return OPAL_ERROR;
+        }
+
+        fprintf(stderr, "[DEBUG] get_ipc_handle: base_addr=%p, alloc_size=%zu\n", base_addr, alloc_size);
+        fflush(stderr);
+
+        /* Export as shareable file descriptor */
+        err = hipMemExportToShareableHandle((void*)&fd, alloc_handle,
+                                            hipMemHandleTypePosixFileDescriptor, 0);
+        
+        fprintf(stderr, "[DEBUG] get_ipc_handle: hipMemExportToShareableHandle returned err=%d, fd=%d\n", err, fd);
+        fflush(stderr);
+        if (hipSuccess != err) {
+            opal_output_verbose(10, opal_accelerator_base_framework.framework_output,
+                                "Failed to export VMM handle as FD");
+            hipMemRelease(alloc_handle);
+            OBJ_DESTRUCT(rocm_handle);
+            return OPAL_ERROR;
+        }
+
+        /* Pack VMM IPC descriptor */
+        vmm_desc.fd = fd;
+        vmm_desc.pid = getpid();
+        vmm_desc.base_addr = base_addr;
+        vmm_desc.alloc_size = alloc_size;
+        vmm_desc.offset = (char*)dev_ptr - (char*)base_addr;
+        vmm_desc.is_vmm = 1;
+
+        /* Ensure it fits in handle */
+        if (sizeof(vmm_desc) > IPC_MAX_HANDLE_SIZE) {
+            opal_output(0, "VMM IPC descriptor too large for handle");
+            close((int)fd);
+            hipMemRelease(alloc_handle);
+            OBJ_DESTRUCT(rocm_handle);
+            return OPAL_ERROR;
+        }
+
+        /* Copy to handle */
+        memcpy(rocm_handle->base.handle, &vmm_desc, sizeof(vmm_desc));
+
+        /* Release our reference (FD keeps handle alive) */
+        hipMemRelease(alloc_handle);
+
+        opal_output_verbose(10, opal_accelerator_base_framework.framework_output,
+                            "VMM IPC handle created: fd=%lu, pid=%u, offset=%zu",
+                            fd, vmm_desc.pid, vmm_desc.offset);
+
+            return OPAL_SUCCESS;
+        } else {
+            /* hipMemRetainAllocationHandle failed - this is not a VMM allocation
+             * Fall through to traditional IPC */
+            fprintf(stderr, "[DEBUG] get_ipc_handle: Not a VMM allocation, falling back to traditional IPC\n");
+            fflush(stderr);
+        }
+    }
+#endif
+
+    /* Traditional IPC for non-VMM allocations */
+    fprintf(stderr, "[DEBUG] get_ipc_handle: Using traditional IPC for dev_ptr=%p\n", dev_ptr);
+    fflush(stderr);
+    hipIpcMemHandle_t rocm_ipc_handle;
     memset(rocm_ipc_handle.reserved, 0, HIP_IPC_HANDLE_SIZE);
-    hipError_t err = hipIpcGetMemHandle(&rocm_ipc_handle,
-                                        (hipDeviceptr_t)dev_ptr);
+
+    err = hipIpcGetMemHandle(&rocm_ipc_handle, (hipDeviceptr_t)dev_ptr);
     if (hipSuccess != err) {
         opal_output_verbose(10, opal_accelerator_base_framework.framework_output,
                             "Error in hipIpcGetMemHandle dev_ptr %p", dev_ptr);
@@ -623,13 +817,189 @@ static int mca_accelerator_rocm_import_ipc_handle(int dev_id, uint8_t ipc_handle
 static int mca_accelerator_rocm_open_ipc_handle(int dev_id, opal_accelerator_ipc_handle_t *handle,
                                                 void **dev_ptr)
 {
+    hipError_t err;
+
     if (NULL == dev_ptr || NULL == handle) {
         return OPAL_ERR_BAD_PARAM;
     }
 
-    hipError_t err = hipIpcOpenMemHandle((hipDeviceptr_t *) &handle->dev_ptr,
-                                         *(hipIpcMemHandle_t*)handle->handle,
-                                         hipIpcMemLazyEnablePeerAccess);
+#if OPAL_ROCM_VMM_SUPPORT
+    struct vmm_ipc_descriptor vmm_desc;
+    memcpy(&vmm_desc, handle->handle, sizeof(vmm_desc));
+
+    fprintf(stderr, "[DEBUG] open_ipc_handle: is_vmm=%u\n", vmm_desc.is_vmm);
+    fflush(stderr);
+
+    if (vmm_desc.is_vmm == 1) {
+        fprintf(stderr, "[DEBUG] open_ipc_handle: VMM path - fd=%lu, pid=%u, size=%zu, offset=%zu\n",
+                vmm_desc.fd, vmm_desc.pid, vmm_desc.alloc_size, vmm_desc.offset);
+        fflush(stderr);
+        
+        /* VMM IPC path using file descriptor */
+        void *local_base_addr = NULL;
+        int pid_fd = -1;
+        int local_fd = -1;
+
+        /* Get file descriptor from remote process */
+        fprintf(stderr, "[DEBUG] open_ipc_handle: Calling pidfd_open for pid=%u\n", vmm_desc.pid);
+        fflush(stderr);
+        
+        pid_fd = syscall(__NR_pidfd_open, vmm_desc.pid, 0);
+        fprintf(stderr, "[DEBUG] open_ipc_handle: pidfd_open returned pid_fd=%d, errno=%d\n", pid_fd, errno);
+        fflush(stderr);
+        
+        if (pid_fd == -1) {
+            fprintf(stderr, "[DEBUG] open_ipc_handle: pidfd_open FAILED with errno=%d\n", errno);
+            fflush(stderr);
+            opal_output_verbose(10, opal_accelerator_base_framework.framework_output,
+                                "pidfd_open failed: errno=%d", errno);
+            return OPAL_ERROR;
+        }
+
+        fprintf(stderr, "[DEBUG] open_ipc_handle: Calling pidfd_getfd with pid_fd=%d, fd=%d\n", 
+                pid_fd, (int)vmm_desc.fd);
+        fflush(stderr);
+        
+        local_fd = syscall(__NR_pidfd_getfd, pid_fd, (int)vmm_desc.fd, 0);
+        fprintf(stderr, "[DEBUG] open_ipc_handle: pidfd_getfd returned local_fd=%d, errno=%d\n", local_fd, errno);
+        fflush(stderr);
+        
+        close(pid_fd);
+
+        if (local_fd == -1) {
+            fprintf(stderr, "[DEBUG] open_ipc_handle: pidfd_getfd FAILED with errno=%d\n", errno);
+            fflush(stderr);
+            opal_output_verbose(10, opal_accelerator_base_framework.framework_output,
+                                "pidfd_getfd failed: errno=%d (may need prctl)", errno);
+            return OPAL_ERROR;
+        }
+
+        fprintf(stderr, "[DEBUG] open_ipc_handle: About to import handle from local_fd=%d\n", local_fd);
+        fflush(stderr);
+        
+        /* Import the allocation handle */
+        hipMemGenericAllocationHandle_t imported_handle;
+#if HIP_VERSION < 7010000
+        err = hipMemImportFromShareableHandle(&imported_handle, (void*)&local_fd,
+                                              hipMemHandleTypePosixFileDescriptor);
+#else
+        err = hipMemImportFromShareableHandle(&imported_handle, (void*)(uintptr_t)local_fd,
+                                              hipMemHandleTypePosixFileDescriptor);
+#endif
+        fprintf(stderr, "[DEBUG] open_ipc_handle: hipMemImportFromShareableHandle returned err=%d, handle=%p\n", 
+                err, (void*)imported_handle);
+        fflush(stderr);
+        
+        if (hipSuccess != err) {
+            fprintf(stderr, "[DEBUG] open_ipc_handle: hipMemImportFromShareableHandle FAILED\n");
+            fflush(stderr);
+            opal_output_verbose(10, opal_accelerator_base_framework.framework_output,
+                                "hipMemImportFromShareableHandle failed");
+            close(local_fd);
+            return OPAL_ERROR;
+        }
+
+        /* Reserve local virtual address space */
+        fprintf(stderr, "[DEBUG] open_ipc_handle: Calling hipMemAddressReserve for size=%zu\n", vmm_desc.alloc_size);
+        fflush(stderr);
+        
+        err = hipMemAddressReserve(&local_base_addr, vmm_desc.alloc_size, 0, 0, 0);
+        
+        fprintf(stderr, "[DEBUG] open_ipc_handle: hipMemAddressReserve returned err=%d, addr=%p\n", 
+                err, local_base_addr);
+        fflush(stderr);
+        
+        if (hipSuccess != err) {
+            fprintf(stderr, "[DEBUG] open_ipc_handle: hipMemAddressReserve FAILED\n");
+            fflush(stderr);
+            opal_output_verbose(10, opal_accelerator_base_framework.framework_output,
+                                "hipMemAddressReserve failed");
+            hipMemRelease(imported_handle);
+            close(local_fd);
+            return OPAL_ERROR;
+        }
+
+        /* Map the allocation to local VA space */
+        fprintf(stderr, "[DEBUG] open_ipc_handle: Calling hipMemMap\n");
+        fflush(stderr);
+        
+        err = hipMemMap(local_base_addr, vmm_desc.alloc_size, 0, imported_handle, 0);
+        
+        fprintf(stderr, "[DEBUG] open_ipc_handle: hipMemMap returned err=%d\n", err);
+        fflush(stderr);
+        
+        if (hipSuccess != err) {
+            fprintf(stderr, "[DEBUG] open_ipc_handle: hipMemMap FAILED\n");
+            fflush(stderr);
+            opal_output_verbose(10, opal_accelerator_base_framework.framework_output,
+                                "hipMemMap failed");
+            hipMemAddressFree(local_base_addr, vmm_desc.alloc_size);
+            hipMemRelease(imported_handle);
+            close(local_fd);
+            return OPAL_ERROR;
+        }
+
+        /* Set access permissions for local device */
+        /* If dev_id is -1, get the current device */
+        int actual_dev_id = dev_id;
+        if (actual_dev_id == MCA_ACCELERATOR_NO_DEVICE_ID) {
+            hipError_t dev_err = hipGetDevice(&actual_dev_id);
+            if (dev_err != hipSuccess) {
+                fprintf(stderr, "[DEBUG] open_ipc_handle: hipGetDevice FAILED, using device 0\n");
+                fflush(stderr);
+                actual_dev_id = 0;  /* Fallback to device 0 */
+            }
+        }
+        
+        fprintf(stderr, "[DEBUG] open_ipc_handle: Calling hipMemSetAccess for dev_id=%d (original=%d)\n", 
+                actual_dev_id, dev_id);
+        fflush(stderr);
+        
+        hipMemAccessDesc access_desc;
+        access_desc.location.type = hipMemLocationTypeDevice;
+        access_desc.location.id = actual_dev_id;
+        access_desc.flags = hipMemAccessFlagsProtReadWrite;
+
+        err = hipMemSetAccess(local_base_addr, vmm_desc.alloc_size, &access_desc, 1);
+        
+        fprintf(stderr, "[DEBUG] open_ipc_handle: hipMemSetAccess returned err=%d\n", err);
+        fflush(stderr);
+        
+        if (hipSuccess != err) {
+            fprintf(stderr, "[DEBUG] open_ipc_handle: hipMemSetAccess FAILED\n");
+            fflush(stderr);
+            opal_output_verbose(10, opal_accelerator_base_framework.framework_output,
+                                "hipMemSetAccess failed");
+            hipMemUnmap(local_base_addr, vmm_desc.alloc_size);
+            hipMemAddressFree(local_base_addr, vmm_desc.alloc_size);
+            hipMemRelease(imported_handle);
+            close(local_fd);
+            return OPAL_ERROR;
+        }
+
+        /* Calculate actual pointer with offset */
+        *dev_ptr = (char*)local_base_addr + vmm_desc.offset;
+        handle->dev_ptr = *dev_ptr;
+
+        /* Close local FD (handle is now imported) */
+        close(local_fd);
+
+        fprintf(stderr, "[DEBUG] open_ipc_handle: SUCCESS! local_base=%p, offset=%zu, dev_ptr=%p\n",
+                local_base_addr, vmm_desc.offset, *dev_ptr);
+        fflush(stderr);
+
+        opal_output_verbose(10, opal_accelerator_base_framework.framework_output,
+                            "VMM IPC handle opened: local_base=%p, offset=%zu, ptr=%p",
+                            local_base_addr, vmm_desc.offset, *dev_ptr);
+
+        return OPAL_SUCCESS;
+    }
+#endif
+
+    /* Traditional IPC path for non-VMM allocations */
+    err = hipIpcOpenMemHandle((hipDeviceptr_t *) &handle->dev_ptr,
+                             *(hipIpcMemHandle_t*)handle->handle,
+                             hipIpcMemLazyEnablePeerAccess);
     if (hipErrorMapFailed == err) {
         return OPAL_ERR_WOULD_BLOCK;
     }
