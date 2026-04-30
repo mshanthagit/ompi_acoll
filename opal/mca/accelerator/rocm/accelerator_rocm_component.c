@@ -32,6 +32,13 @@ int opal_accelerator_rocm_verbose = 0;
 size_t opal_accelerator_rocm_memcpyD2H_limit=1024;
 size_t opal_accelerator_rocm_memcpyH2D_limit=1048576;
 
+#if HIP_VERSION >= 50300000
+/* MCA parameter to enable/disable VMM IPC support at runtime
+ * Enable with: --mca mpi_accelerator_rocm_vmm_support 1  (default is 0 - disabled)
+ */
+int opal_accelerator_rocm_vmm_support = 0;
+#endif
+
 /* Initialization lock for lazy rocm initialization */
 static opal_mutex_t accelerator_rocm_init_lock;
 static bool accelerator_rocm_init_complete = false;
@@ -177,6 +184,21 @@ static int accelerator_rocm_component_register(void)
                                               &opal_accelerator_rocm_memcpy_async);
     (void) mca_base_var_register_synonym (var_id, "ompi", "mpi", "accelerator_rocm", "memcpy_async",
                                           MCA_BASE_VAR_SYN_FLAG_DEPRECATED);
+
+#if HIP_VERSION >= 50300000
+    /* Enable/disable VMM-based IPC support */
+    opal_accelerator_rocm_vmm_support = 0;
+    var_id = mca_base_component_var_register (&mca_accelerator_rocm_component.super.base_version,
+                                              "vmm_support",
+                                              "Enable VMM-based IPC support (0=disabled, 1=enabled). "
+                                              "Default is disabled.",
+                                              MCA_BASE_VAR_TYPE_INT, NULL, 0, 0, OPAL_INFO_LVL_9,
+                                              MCA_BASE_VAR_SCOPE_READONLY,
+                                              &opal_accelerator_rocm_vmm_support);
+    (void) mca_base_var_register_synonym (var_id, "ompi", "mpi", "accelerator_rocm", "vmm_support",
+                                          MCA_BASE_VAR_SYN_FLAG_DEPRECATED);
+#endif
+
     return OPAL_SUCCESS;
 }
 

@@ -78,6 +78,10 @@ extern size_t opal_accelerator_rocm_memcpyD2H_limit;
 extern int opal_accelerator_rocm_num_devices;
 extern float *opal_accelerator_rocm_mem_bw;
 
+#if HIP_VERSION >= 50300000
+extern int opal_accelerator_rocm_vmm_support;
+#endif
+
 extern int opal_accelerator_rocm_lazy_init(void);
 
 #endif
