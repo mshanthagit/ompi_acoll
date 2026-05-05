@@ -80,6 +80,8 @@ extern float *opal_accelerator_rocm_mem_bw;
 
 #if HIP_VERSION >= 50300000
 extern int opal_accelerator_rocm_vmm_support;
+extern void mca_accelerator_rocm_vmm_cache_init(void);
+extern void mca_accelerator_rocm_vmm_cache_fini(void);
 #endif
 
 extern int opal_accelerator_rocm_lazy_init(void);

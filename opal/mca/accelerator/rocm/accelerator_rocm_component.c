@@ -336,11 +336,19 @@ static opal_accelerator_base_module_t* accelerator_rocm_init(void)
     opal_atomic_mb();
     opal_rocm_runtime_initialized = true;
 
+#if HIP_VERSION >= 50300000
+    mca_accelerator_rocm_vmm_cache_init();
+#endif
+
     return &opal_accelerator_rocm_module;
 }
 
 static void accelerator_rocm_finalize(opal_accelerator_base_module_t* module)
 {
+#if HIP_VERSION >= 50300000
+    mca_accelerator_rocm_vmm_cache_fini();
+#endif
+
     if (NULL != opal_accelerator_rocm_MemcpyStream) {
         hipError_t err = hipStreamDestroy(*opal_accelerator_rocm_MemcpyStream);
         if (hipSuccess != err) {
