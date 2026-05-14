@@ -486,14 +486,17 @@ static int mca_accelerator_rocm_memcpy(int dest_dev_id, int src_dev_id, void *de
     if (0 == size) {
         return OPAL_SUCCESS;
     }
-    if ((type == MCA_ACCELERATOR_TRANSFER_DTOH ||
-	 type == MCA_ACCELERATOR_TRANSFER_UNSPEC) &&
-	size <= opal_accelerator_rocm_memcpyD2H_limit) {
+    if (!opal_accelerator_rocm_vmm_support &&
+        (type == MCA_ACCELERATOR_TRANSFER_DTOH ||
+         type == MCA_ACCELERATOR_TRANSFER_UNSPEC) &&
+        size <= opal_accelerator_rocm_memcpyD2H_limit) {
         memcpy(dest, src, size);
         return OPAL_SUCCESS;
     }
 
-    if (type == MCA_ACCELERATOR_TRANSFER_HTOD && size <= opal_accelerator_rocm_memcpyH2D_limit) {
+    if (!opal_accelerator_rocm_vmm_support &&
+        type == MCA_ACCELERATOR_TRANSFER_HTOD &&
+        size <= opal_accelerator_rocm_memcpyH2D_limit) {
         memcpy(dest, src, size);
         return OPAL_SUCCESS;
     }
@@ -912,7 +915,7 @@ static int mca_accelerator_rocm_open_ipc_handle(int dev_id, opal_accelerator_ipc
         if (NULL != region) {
             /* Cache hit: allocation already mapped in this process */
             region->refcount++;
-            *dev_ptr      = (char *)region->local_base_addr + vmm_desc.offset;
+            *dev_ptr      = region->local_base_addr;
             handle->dev_ptr = *dev_ptr;
             OPAL_THREAD_UNLOCK(&vmm_cache_lock);
             opal_output_verbose(10, opal_accelerator_base_framework.framework_output,
@@ -1025,9 +1028,8 @@ static int mca_accelerator_rocm_open_ipc_handle(int dev_id, opal_accelerator_ipc
         opal_hash_table_set_value_ptr(&vmm_region_cache, &region_key, sizeof(region_key), region);
         OPAL_THREAD_UNLOCK(&vmm_cache_lock);
 
-        *dev_ptr        = (char *)local_base_addr + vmm_desc.offset;
+        *dev_ptr        = local_base_addr;
         handle->dev_ptr = *dev_ptr;
-
         opal_output_verbose(10, opal_accelerator_base_framework.framework_output,
                             "VMM IPC handle opened: local_base=%p offset=%zu ptr=%p",
                             local_base_addr, vmm_desc.offset, *dev_ptr);
