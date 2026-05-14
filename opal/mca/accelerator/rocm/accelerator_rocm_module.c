@@ -192,6 +192,19 @@ typedef struct {
 } vmm_mapped_region_t;
 
 /*
+ * vmm_export_cache: base_addr -> exported FD (sender side).
+ * Caches the FD produced by hipMemExportToShareableHandle for each local VMM
+ * allocation.  hipMemExportToShareableHandle may crash when called multiple
+ * times on the same allocation in certain HIP driver states (e.g. after a
+ * receiver has imported and mapped the allocation).  By caching the first FD
+ * and reusing it for subsequent fragment registrations of the same allocation,
+ * we call hipMemExportToShareableHandle exactly once per allocation.
+ * Key:   void* (base_addr from hipMemGetAddressRange)
+ * Value: int fd, stored as void* via uintptr_t cast
+ */
+static opal_hash_table_t vmm_export_cache;
+
+/*
  * pidfd_cache: pid -> pid_fd (the receiver's pidfd handle for a peer process).
  * Avoids calling pidfd_open() more than once per peer.
  * Key:   uint64_t (sender pid, widened from uint32_t)
@@ -220,6 +233,8 @@ void mca_accelerator_rocm_vmm_cache_init(void)
     opal_hash_table_init(&vmm_pidfd_cache, 64);
     OBJ_CONSTRUCT(&vmm_region_cache, opal_hash_table_t);
     opal_hash_table_init(&vmm_region_cache, 256);
+    OBJ_CONSTRUCT(&vmm_export_cache, opal_hash_table_t);
+    opal_hash_table_init(&vmm_export_cache, 64);
     vmm_cache_initialized = true;
 }
 
@@ -238,6 +253,16 @@ void mca_accelerator_rocm_vmm_cache_fini(void)
         free(region);
     });
 
+    /* Walk export_cache and close any cached sender FDs */
+    void *exp_key;
+    void *exp_fd_val;
+    OPAL_HASH_TABLE_FOREACH_PTR(exp_key, exp_fd_val, &vmm_export_cache, {
+        int exp_fd = (int)(uintptr_t)exp_fd_val;
+        if (exp_fd >= 0) {
+            close(exp_fd);
+        }
+    });
+
     /* Walk pidfd_cache and close any open pidfds */
     uint64_t pid_key;
     void *pid_fd_val;
@@ -248,6 +273,7 @@ void mca_accelerator_rocm_vmm_cache_fini(void)
         }
     }
 
+    OBJ_DESTRUCT(&vmm_export_cache);
     OBJ_DESTRUCT(&vmm_region_cache);
     OBJ_DESTRUCT(&vmm_pidfd_cache);
     OBJ_DESTRUCT(&vmm_cache_lock);
@@ -763,13 +789,10 @@ static int mca_accelerator_rocm_get_ipc_handle(int dev_id, void *dev_ptr,
         return OPAL_ERR_BAD_PARAM;
     }
 
-    // Check if pointer supports legacy IPC
+    /* Check if pointer supports legacy IPC */
     int is_legacy_ipc = 0;
-    /* HIP_POINTER_ATTRIBUTE_IS_LEGACY_HIP_IPC_CAPABLE seems to be present from 5.0.3.
-    * ToDo: do we need guardrails?
-    */
     err = hipPointerGetAttribute(&is_legacy_ipc,
-                                HIP_POINTER_ATTRIBUTE_IS_LEGACY_HIP_IPC_CAPABLE /* warnings in the documentation*/,
+                                HIP_POINTER_ATTRIBUTE_IS_LEGACY_HIP_IPC_CAPABLE,
                                 (hipDeviceptr_t)dev_ptr);
 
     rocm_handle = (opal_accelerator_rocm_ipc_handle_t *) handle;
@@ -786,32 +809,63 @@ static int mca_accelerator_rocm_get_ipc_handle(int dev_id, void *dev_ptr,
             mca_accelerator_rocm_vmm_prctl_set = 1;
         }
 
-        /* hipMemRetainAllocationHandle succeeds only for VMM pointers */
-        hipMemGenericAllocationHandle_t alloc_handle;
-        err = hipMemRetainAllocationHandle(&alloc_handle, dev_ptr);
-
-        if (hipSuccess == err) {
-        /* VMM allocation: export as a shareable file descriptor */
+        /* hipMemRetainAllocationHandle succeeds only for VMM pointers.
+         * It must be called with the allocation base — passing a mid-allocation
+         * offset returns a handle that crashes on hipMemRelease.  Use
+         * hipMemGetAddressRange to find the base first, then retain from the base.
+         * hipMemGetAddressRange also serves as the VMM detector: it only succeeds
+         * for pointers that belong to a VMM allocation. */
         struct vmm_ipc_descriptor vmm_desc;
-        void *base_addr;
-        size_t alloc_size;
-        int fd;
+        void *base_addr = NULL;
+        size_t alloc_size = 0;
+        int fd = -1;
 
+        /* Resolve the allocation base first.  For VMM pointers hipMemGetAddressRange
+         * returns the base of the hipMemCreate allocation; for non-VMM device
+         * pointers (hipMalloc) it also succeeds but hipMemRetainAllocationHandle
+         * on the base will then fail, acting as the definitive VMM discriminator.
+         * We always retain from the base — retaining from a mid-allocation offset
+         * returns a handle that crashes on hipMemRelease. */
         err = hipMemGetAddressRange(&base_addr, &alloc_size, (hipDeviceptr_t)dev_ptr);
         if (hipSuccess != err) {
-            hipMemRelease(alloc_handle);
-            OBJ_DESTRUCT(rocm_handle);
-            return OPAL_ERROR;
+            /* Cannot be a VMM pointer — fall through to traditional IPC */
+            goto traditional_ipc;
         }
 
-        err = hipMemExportToShareableHandle((void*)&fd, alloc_handle,
-                                            hipMemHandleTypePosixFileDescriptor, 0);
-        if (hipSuccess != err) {
-            opal_output_verbose(10, opal_accelerator_base_framework.framework_output,
-                                "Failed to export VMM handle as FD");
+        OPAL_THREAD_LOCK(&vmm_cache_lock);
+
+        /* Check export cache: if this allocation was already exported from this
+         * process, reuse the cached FD.  hipMemExportToShareableHandle may crash
+         * when called on the same VMM allocation multiple times in certain HIP
+         * driver states (e.g. after a peer process has imported the allocation). */
+        void *cached_fd_val = NULL;
+        opal_hash_table_get_value_ptr(&vmm_export_cache, &base_addr, sizeof(base_addr),
+                                      &cached_fd_val);
+        if (NULL != cached_fd_val) {
+            fd = (int)(uintptr_t)cached_fd_val;
+        } else {
+            hipMemGenericAllocationHandle_t alloc_handle;
+            err = hipMemRetainAllocationHandle(&alloc_handle, base_addr);
+            if (hipSuccess != err) {
+                /* Not a VMM allocation — fall through to traditional IPC */
+                OPAL_THREAD_UNLOCK(&vmm_cache_lock);
+                goto traditional_ipc;
+            }
+
+            err = hipMemExportToShareableHandle((void*)&fd, alloc_handle,
+                                                hipMemHandleTypePosixFileDescriptor, 0);
             hipMemRelease(alloc_handle);
-            OBJ_DESTRUCT(rocm_handle);
-            return OPAL_ERROR;
+            if (hipSuccess != err) {
+                opal_output_verbose(10, opal_accelerator_base_framework.framework_output,
+                                    "Failed to export VMM handle as FD");
+                OPAL_THREAD_UNLOCK(&vmm_cache_lock);
+                OBJ_DESTRUCT(rocm_handle);
+                return OPAL_ERROR;
+            }
+
+            /* Cache the FD for future registrations of the same allocation */
+            opal_hash_table_set_value_ptr(&vmm_export_cache, &base_addr, sizeof(base_addr),
+                                          (void *)(uintptr_t)fd);
         }
 
         /* Pack VMM IPC descriptor */
@@ -827,24 +881,22 @@ static int mca_accelerator_rocm_get_ipc_handle(int dev_id, void *dev_ptr,
         /* Ensure it fits in handle */
         if (sizeof(vmm_desc) > IPC_MAX_HANDLE_SIZE) {
             opal_output(0, "VMM IPC descriptor too large for handle");
-            close((int)fd);
-            hipMemRelease(alloc_handle);
+            OPAL_THREAD_UNLOCK(&vmm_cache_lock);
             OBJ_DESTRUCT(rocm_handle);
             return OPAL_ERROR;
         }
 
         /* Copy to handle */
         memcpy(rocm_handle->base.handle, &vmm_desc, sizeof(vmm_desc));
-
-        /* Release our reference (FD keeps handle alive) */
-        hipMemRelease(alloc_handle);
+        OPAL_THREAD_UNLOCK(&vmm_cache_lock);
 
         opal_output_verbose(10, opal_accelerator_base_framework.framework_output,
                             "VMM IPC handle created: fd=%d, pid=%u, offset=%zu, handle_type=0",
                             fd, vmm_desc.pid, vmm_desc.offset);
 
-            return OPAL_SUCCESS;
-        }
+        return OPAL_SUCCESS;
+
+        traditional_ipc:;
     }
 #endif
 
@@ -1057,12 +1109,22 @@ static int mca_accelerator_rocm_open_ipc_handle(int dev_id, opal_accelerator_ipc
 static int mca_accelerator_rocm_compare_ipc_handles(uint8_t handle_1[IPC_MAX_HANDLE_SIZE],
                                                     uint8_t handle_2[IPC_MAX_HANDLE_SIZE])
 {
-    /*
-     * The HIP IPC handles consists of multiple elements.
-     * We will only use the ROCr IPC handle (32 bytes, starting at pos 0)
-     * and the process ID for comparison.
-     * We definitily need to exclude the offset component in the comparison.
-     */
+#if OPAL_ROCM_VMM_SUPPORT
+    /* VMM handles are identified by handle_type == 0 at byte 48.
+     * Two VMM handles refer to the same allocation when they share the same
+     * pid (bytes 4-7) and base_addr (bytes 8-15).  The fd (bytes 0-3) differs
+     * on every hipMemExportToShareableHandle call for the same allocation and
+     * must be excluded from the comparison, otherwise rgpusm sees a false
+     * mismatch on every fragment beyond the first and evicts live registrations. */
+    uint32_t *type_1 = (uint32_t *)&handle_1[48];
+    uint32_t *type_2 = (uint32_t *)&handle_2[48];
+    if (*type_1 == 0 && *type_2 == 0) {
+        return memcmp(&handle_1[4], &handle_2[4], sizeof(uint32_t) + sizeof(void *));
+    }
+#endif
+
+    /* Traditional IPC: compare the 32-byte ROCr handle and the pid.
+     * We exclude the offset component in the comparison. */
     static const int rocr_ipc_handle_size = 32;
     static const int pos = rocr_ipc_handle_size + 2*sizeof(size_t);
     int *pid_1 = (int *)&handle_1[pos];
@@ -1260,24 +1322,38 @@ static int mca_accelerator_rocm_get_buffer_id(int dev_id, const void *addr, opal
 {
     *buf_id = 0;
 
+    /* hipPointerGetAttribute(BUFFER_ID) and hipPointerSetAttribute(SYNC_MEMOPS)
+     * are not supported for VMM pointers (hipMemCreate + hipMemMap) and corrupt
+     * HIP driver state if called on them, causing subsequent
+     * hipMemExportToShareableHandle to crash.  Detect VMM via IS_LEGACY_HIP_IPC_CAPABLE
+     * and skip both calls for non-legacy (VMM) pointers. */
+    int is_legacy_ipc = 1;
 #if HIP_VERSION >= 50120531
-    hipError_t result = hipPointerGetAttribute((unsigned long long *)buf_id, HIP_POINTER_ATTRIBUTE_BUFFER_ID,
-                                               (hipDeviceptr_t)addr);
-    if (hipSuccess != result) {
-        opal_output_verbose(10, opal_accelerator_base_framework.framework_output,
-                            "error in hipPointerGetAttribute, could not retrieve buffer_id");
-        return OPAL_ERROR;
+    (void)hipPointerGetAttribute(&is_legacy_ipc,
+                                 HIP_POINTER_ATTRIBUTE_IS_LEGACY_HIP_IPC_CAPABLE,
+                                 (hipDeviceptr_t)addr);
+    if (is_legacy_ipc) {
+        hipError_t result = hipPointerGetAttribute((unsigned long long *)buf_id,
+                                                   HIP_POINTER_ATTRIBUTE_BUFFER_ID,
+                                                   (hipDeviceptr_t)addr);
+        if (hipSuccess != result) {
+            opal_output_verbose(10, opal_accelerator_base_framework.framework_output,
+                                "error in hipPointerGetAttribute, could not retrieve buffer_id");
+            return OPAL_ERROR;
+        }
     }
 #endif
 
 #if HIP_VERSION >= 50530201
-    int enable = 1;
-    hipError_t err = hipPointerSetAttribute(&enable, HIP_POINTER_ATTRIBUTE_SYNC_MEMOPS,
-                                            (hipDeviceptr_t)addr);
-    if (hipSuccess != err) {
-        opal_output_verbose(10, opal_accelerator_base_framework.framework_output,
-                            "error in hipPointerSetAttribute, could not set SYNC_MEMOPS");
-        return OPAL_ERROR;
+    if (is_legacy_ipc) {
+        int enable = 1;
+        hipError_t err = hipPointerSetAttribute(&enable, HIP_POINTER_ATTRIBUTE_SYNC_MEMOPS,
+                                                (hipDeviceptr_t)addr);
+        if (hipSuccess != err) {
+            opal_output_verbose(10, opal_accelerator_base_framework.framework_output,
+                                "error in hipPointerSetAttribute, could not set SYNC_MEMOPS");
+            return OPAL_ERROR;
+        }
     }
 #endif
     return OPAL_SUCCESS;

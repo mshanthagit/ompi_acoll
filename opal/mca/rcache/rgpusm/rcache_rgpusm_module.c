@@ -103,16 +103,9 @@ static int mca_rcache_rgpusm_open_mem_handle(void *base, size_t size, mca_rcache
     int result;
     mca_opal_gpu_reg_t *gpu_newreg = (mca_opal_gpu_reg_t *) newreg;
 
-    fprintf(stderr, "[DEBUG] open_mem_handle: About to call open_ipc_handle for base=%p, size=%zu\n", base, size);
-    fflush(stderr);
-    
     // Note: It is expected that the ipc_handle object was created previously in the smcuda component
     result = opal_accelerator.open_ipc_handle(MCA_ACCELERATOR_NO_DEVICE_ID, &gpu_newreg->data.ipcHandle,
                                               (void**)&newreg->alloc_base);
-    
-    fprintf(stderr, "[DEBUG] open_mem_handle: open_ipc_handle returned result=%d, alloc_base=%p\n", 
-            result, (void*)newreg->alloc_base);
-    fflush(stderr);
     if (OPAL_ERR_WOULD_BLOCK == result) {
         // ERROR_ALREADY_MAPPED
         opal_output_verbose(10, mca_rcache_rgpusm_component.output,
@@ -316,7 +309,16 @@ int mca_rcache_rgpusm_register(mca_rcache_base_module_t *rcache, void *addr, siz
              * be in use.  Assert on that just to make sure. */
             assert(0 == (*reg)->ref_count);
             if (mca_rcache_rgpusm_component.leave_pinned) {
-                opal_list_remove_item(&rcache_rgpusm->lru_list, (opal_list_item_t *) (*reg));
+                /* Only remove from the LRU list if the item is actually on it.
+                 * opal_list_prev is NULL when the item has never been added to
+                 * any list (or was already removed).  VMM handles can trigger a
+                 * spurious mismatch here because each hipMemExportToShareableHandle
+                 * call produces a new FD, making two exports of the same allocation
+                 * compare as different.  The stale registration may still have
+                 * ref_count > 0 and was therefore never pushed to the LRU. */
+                if (NULL != ((opal_list_item_t *)*reg)->opal_list_prev) {
+                    opal_list_remove_item(&rcache_rgpusm->lru_list, (opal_list_item_t *) (*reg));
+                }
             }
 
             /* Bump the reference count to keep things copacetic in deregister */
