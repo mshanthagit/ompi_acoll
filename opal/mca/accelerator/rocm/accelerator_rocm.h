@@ -70,7 +70,7 @@ struct opal_accelerator_rocm_ipc_event_handle_t {
 typedef struct opal_accelerator_rocm_ipc_event_handle_t opal_accelerator_rocm_ipc_event_handle_t;
 OBJ_CLASS_DECLARATION(opal_accelerator_rocm_ipc_event_handle_t);
 
-extern hipStream_t *opal_accelerator_rocm_MemcpyStream;
+extern hipStream_t *opal_accelerator_rocm_MemcpyStreams;
 extern int opal_accelerator_rocm_memcpy_async;
 extern int opal_accelerator_rocm_verbose;
 extern size_t opal_accelerator_rocm_memcpyH2D_limit;

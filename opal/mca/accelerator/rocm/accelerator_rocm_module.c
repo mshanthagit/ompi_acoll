@@ -528,14 +528,22 @@ static int mca_accelerator_rocm_memcpy(int dest_dev_id, int src_dev_id, void *de
     }
 
     if (opal_accelerator_rocm_memcpy_async) {
-        err = hipMemcpyAsync(dest, src, size, hipMemcpyDefault,
-                                       *opal_accelerator_rocm_MemcpyStream);
+        int delayed_init = opal_accelerator_rocm_lazy_init();
+        if (OPAL_UNLIKELY(0 != delayed_init)) {
+            return delayed_init;
+        }
+        int dev = (src_dev_id != MCA_ACCELERATOR_NO_DEVICE_ID) ? src_dev_id : dest_dev_id;
+        if (dev == MCA_ACCELERATOR_NO_DEVICE_ID) {
+            hipGetDevice(&dev);
+        }
+        hipStream_t stream = opal_accelerator_rocm_MemcpyStreams[dev];
+        err = hipMemcpyAsync(dest, src, size, hipMemcpyDefault, stream);
         if (hipSuccess != err ) {
             opal_output_verbose(10, opal_accelerator_base_framework.framework_output,
                                 "error starting async copy\n");
             return OPAL_ERROR;
         }
-        err = hipStreamSynchronize(*opal_accelerator_rocm_MemcpyStream);
+        err = hipStreamSynchronize(stream);
         if (hipSuccess != err ) {
             opal_output_verbose(10, opal_accelerator_base_framework.framework_output,
                                 "error synchronizing stream after async copy\n");
@@ -616,23 +624,30 @@ static int mca_accelerator_rocm_memmove(int dest_dev_id, int src_dev_id, void *d
     }
 
     if (opal_accelerator_rocm_memcpy_async) {
-        err = hipMemcpyAsync(tmp, src, size, hipMemcpyDefault,
-                                       *opal_accelerator_rocm_MemcpyStream);
+        int delayed_init = opal_accelerator_rocm_lazy_init();
+        if (OPAL_UNLIKELY(0 != delayed_init)) {
+            return delayed_init;
+        }
+        int dev = (src_dev_id != MCA_ACCELERATOR_NO_DEVICE_ID) ? src_dev_id : dest_dev_id;
+        if (dev == MCA_ACCELERATOR_NO_DEVICE_ID) {
+            hipGetDevice(&dev);
+        }
+        hipStream_t stream = opal_accelerator_rocm_MemcpyStreams[dev];
+        err = hipMemcpyAsync(tmp, src, size, hipMemcpyDefault, stream);
         if (hipSuccess != err ) {
             opal_output_verbose(10, opal_accelerator_base_framework.framework_output,
                                 "error in async memcpy for memmove\n");
             return OPAL_ERROR;
         }
 
-        err = hipMemcpyAsync(dest, tmp, size, hipMemcpyDefault,
-                                       *opal_accelerator_rocm_MemcpyStream);
+        err = hipMemcpyAsync(dest, tmp, size, hipMemcpyDefault, stream);
         if (hipSuccess != err ) {
             opal_output_verbose(10, opal_accelerator_base_framework.framework_output,
                                 "error in async memcpy for memmove\n");
             return OPAL_ERROR;
         }
 
-        err = hipStreamSynchronize(*opal_accelerator_rocm_MemcpyStream);
+        err = hipStreamSynchronize(stream);
         if (hipSuccess != err ) {
             opal_output_verbose(10, opal_accelerator_base_framework.framework_output,
                                 "error synchronizing stream for memmove\n");

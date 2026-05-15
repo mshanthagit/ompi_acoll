@@ -46,7 +46,7 @@ static bool accelerator_rocm_init_complete = false;
 /* Define global variables, used in accelerator_rocm.c */
 int opal_accelerator_rocm_num_devices = 0;
 float *opal_accelerator_rocm_mem_bw = NULL;
-hipStream_t *opal_accelerator_rocm_MemcpyStream = NULL;
+hipStream_t *opal_accelerator_rocm_MemcpyStreams = NULL;
 
 /*
  * Public string showing the accelerator rocm component version number
@@ -228,22 +228,43 @@ int opal_accelerator_rocm_lazy_init()
         goto out;
     }
 
-    hipStream_t memcpy_stream;
-    hip_err = hipStreamCreate(&memcpy_stream);
+    int saved_dev;
+    hip_err = hipGetDevice(&saved_dev);
     if (hipSuccess != hip_err) {
-        opal_output(0, "Could not create hipStream, err=%d %s\n",
+        opal_output(0, "Could not get current device, err=%d %s\n",
                 hip_err, hipGetErrorString(hip_err));
-        err = OPAL_ERROR;  // we got hipErrorInvalidValue, pretty bad
+        err = OPAL_ERROR;
         goto out;
     }
 
-    opal_accelerator_rocm_MemcpyStream = malloc(sizeof(hipStream_t));
-    if (NULL == opal_accelerator_rocm_MemcpyStream) {
-        opal_output(0, "Could not allocate hipStream\n");
+    opal_accelerator_rocm_MemcpyStreams = malloc(opal_accelerator_rocm_num_devices * sizeof(hipStream_t));
+    if (NULL == opal_accelerator_rocm_MemcpyStreams) {
+        opal_output(0, "Could not allocate MemcpyStreams array\n");
         err = OPAL_ERR_OUT_OF_RESOURCE;
         goto out;
     }
-    *opal_accelerator_rocm_MemcpyStream = memcpy_stream;
+
+    for (int i = 0; i < opal_accelerator_rocm_num_devices; i++) {
+        hip_err = hipSetDevice(i);
+        if (hipSuccess != hip_err) {
+            opal_output(0, "Could not set device %d, err=%d %s\n",
+                    i, hip_err, hipGetErrorString(hip_err));
+            free(opal_accelerator_rocm_MemcpyStreams);
+            opal_accelerator_rocm_MemcpyStreams = NULL;
+            err = OPAL_ERROR;
+            goto out;
+        }
+        hip_err = hipStreamCreate(&opal_accelerator_rocm_MemcpyStreams[i]);
+        if (hipSuccess != hip_err) {
+            opal_output(0, "Could not create hipStream for device %d, err=%d %s\n",
+                    i, hip_err, hipGetErrorString(hip_err));
+            free(opal_accelerator_rocm_MemcpyStreams);
+            opal_accelerator_rocm_MemcpyStreams = NULL;
+            err = OPAL_ERROR;
+            goto out;
+        }
+    }
+    hipSetDevice(saved_dev);
 
     opal_accelerator_rocm_mem_bw = malloc(sizeof(float)*opal_accelerator_rocm_num_devices);
     if (NULL == opal_accelerator_rocm_mem_bw) {
@@ -349,13 +370,15 @@ static void accelerator_rocm_finalize(opal_accelerator_base_module_t* module)
     mca_accelerator_rocm_vmm_cache_fini();
 #endif
 
-    if (NULL != opal_accelerator_rocm_MemcpyStream) {
-        hipError_t err = hipStreamDestroy(*opal_accelerator_rocm_MemcpyStream);
-        if (hipSuccess != err) {
-            opal_output_verbose(10, 0, "hip_dl_finalize: error while destroying the hipStream\n");
+    if (NULL != opal_accelerator_rocm_MemcpyStreams) {
+        for (int i = 0; i < opal_accelerator_rocm_num_devices; i++) {
+            hipError_t err = hipStreamDestroy(opal_accelerator_rocm_MemcpyStreams[i]);
+            if (hipSuccess != err) {
+                opal_output_verbose(10, 0, "hip_dl_finalize: error destroying hipStream for device %d\n", i);
+            }
         }
-        free(opal_accelerator_rocm_MemcpyStream);
-        opal_accelerator_rocm_MemcpyStream = NULL;
+        free(opal_accelerator_rocm_MemcpyStreams);
+        opal_accelerator_rocm_MemcpyStreams = NULL;
 
         free(opal_accelerator_rocm_mem_bw);
         opal_accelerator_rocm_mem_bw = NULL;
