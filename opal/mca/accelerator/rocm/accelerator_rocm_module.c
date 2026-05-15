@@ -39,7 +39,7 @@
  *   sizeof(struct vmm_ipc_descriptor) must equal 64
  *   offsetof(struct vmm_ipc_descriptor, handle_type) must equal 48
  */
-#if HIP_VERSION >= 50300000
+#if HIP_VERSION >= 70100000
 #define OPAL_ROCM_VMM_SUPPORT 1
 struct vmm_ipc_descriptor {
     int32_t fd;            /* Bytes 0-3:   File descriptor (shareable) */
@@ -1029,13 +1029,7 @@ static int mca_accelerator_rocm_open_ipc_handle(int dev_id, opal_accelerator_ipc
 
         /* Import the allocation handle from the local fd copy */
         hipMemGenericAllocationHandle_t imported_handle;
-#if HIP_VERSION < 7010000
-        err = hipMemImportFromShareableHandle(&imported_handle, (void*)&local_fd,
-                                              hipMemHandleTypePosixFileDescriptor);
-#else
-        err = hipMemImportFromShareableHandle(&imported_handle, (void*)(uintptr_t)local_fd,
-                                              hipMemHandleTypePosixFileDescriptor);
-#endif
+        err = hipMemImportFromShareableHandle(&imported_handle, (void*)(uintptr_t)local_fd, hipMemHandleTypePosixFileDescriptor);
         close(local_fd);
         if (hipSuccess != err) {
             opal_output_verbose(10, opal_accelerator_base_framework.framework_output,
