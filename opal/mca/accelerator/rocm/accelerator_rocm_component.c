@@ -20,6 +20,7 @@
 #include "opal_config.h"
 
 #include <stdio.h>
+#include <sys/utsname.h>
 
 #include "opal/mca/dl/base/base.h"
 #include "opal/mca/accelerator/base/base.h"
@@ -353,6 +354,50 @@ static opal_accelerator_base_module_t* accelerator_rocm_init(void)
         opal_output(0, "No HIP capabale device found. Disabling component.\n");
         return NULL;
     }
+
+#if HIP_VERSION >= 70100000
+    /* Warn if the Linux kernel is older than 6.8 — pidfd_getfd is unreliable
+     * on earlier kernels and will produce confusing EPERM failures at runtime. */
+    {
+        struct utsname kernel_info;
+        if (uname(&kernel_info) == 0) {
+            int kmajor = 0, kminor = 0;
+            if (sscanf(kernel_info.release, "%d.%d", &kmajor, &kminor) == 2) {
+                if (kmajor < 6 || (kmajor == 6 && kminor < 8)) {
+                    opal_output_verbose(1, opal_accelerator_base_framework.framework_output,
+                                        "ROCm accelerator: Linux kernel %d.%d detected. "
+                                        "VMM IPC via pidfd requires kernel 6.8 or higher "
+                                        "for reliable operation.",
+                                        kmajor, kminor);
+                }
+            }
+        }
+    }
+
+    /* Verify hardware VMM support before honouring the vmm_support MCA param.
+     * If the user enabled VMM but no device reports the attribute, disable it
+     * now and emit a clear diagnostic rather than failing silently later. */
+    if (opal_accelerator_rocm_vmm_support) {
+        bool any_vmm = false;
+        for (int i = 0; i < count; i++) {
+            int vmm_supported = 0;
+            hipError_t vmm_err = hipDeviceGetAttribute(
+                &vmm_supported,
+                hipDeviceAttributeVirtualMemoryManagementSupported, i);
+            if (hipSuccess == vmm_err && vmm_supported) {
+                any_vmm = true;
+                break;
+            }
+        }
+        if (!any_vmm) {
+            opal_output(0, "ROCm accelerator: VMM IPC requested "
+                        "(accelerator_rocm_vmm_support=1) but no device reports "
+                        "hipDeviceAttributeVirtualMemoryManagementSupported. "
+                        "Disabling VMM IPC.");
+            opal_accelerator_rocm_vmm_support = 0;
+        }
+    }
+#endif
 
     opal_atomic_mb();
     opal_rocm_runtime_initialized = true;

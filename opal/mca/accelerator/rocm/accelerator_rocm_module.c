@@ -820,7 +820,13 @@ static int mca_accelerator_rocm_get_ipc_handle(int dev_id, void *dev_ptr,
     if (opal_accelerator_rocm_vmm_support && !is_legacy_ipc) {
         /* Set prctl permission for FD exchange (only once per process) */
         if (!mca_accelerator_rocm_vmm_prctl_set) {
-            prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+            if (prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0) != 0) {
+                opal_output_verbose(1, opal_accelerator_base_framework.framework_output,
+                                    "prctl(PR_SET_PTRACER_ANY) failed (errno=%d): "
+                                    "VMM IPC peers may need CAP_SYS_PTRACE or "
+                                    "pidfd_getfd will be denied on the receiver.",
+                                    errno);
+            }
             mca_accelerator_rocm_vmm_prctl_set = 1;
         }
 
